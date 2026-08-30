@@ -2,7 +2,7 @@
 // Keep the AI-vs-fallback branching on the server so the client
 // never needs to know about the OPENAI_API_KEY.
 
-import type { CandidateProfile, Question, AnswerEvaluation, QAExchange, InterviewSummary, Difficulty } from "./types";
+import type { CandidateProfile, Question, AnswerEvaluation, QAExchange, InterviewSummary } from "./types";
 
 async function post<T>(url: string, body: unknown): Promise<T> {
   const res = await fetch(url, {
@@ -12,16 +12,6 @@ async function post<T>(url: string, body: unknown): Promise<T> {
   });
   if (!res.ok) throw new Error(`${url} failed: ${res.status}`);
   return res.json() as Promise<T>;
-}
-
-export async function apiGenerateQuestion(input: {
-  profile: CandidateProfile;
-  index: number;
-  difficulty: Difficulty;
-  askedTexts: string[];
-}): Promise<Question> {
-  const { question } = await post<{ question: Question }>("/api/generate-question", input);
-  return question;
 }
 
 export async function apiEvaluateAnswer(input: {

@@ -7,19 +7,10 @@
 
 import { useEffect } from "react";
 import { useInterview } from "@/lib/store";
-import { apiGenerateQuestion, apiEvaluateAnswer, apiSummarize } from "@/lib/api";
+import { apiEvaluateAnswer, apiSummarize } from "@/lib/api";
 import { awaitAnswer, cancelPending } from "@/lib/answerBridge";
 import { difficultyFor } from "@/lib/questionBank";
 import type { CandidateProfile, Difficulty, QuestionType } from "@/lib/types";
-
-const TYPE_ROTATION_ARR: QuestionType[] = [
-  "behavioral",
-  "technical",
-  "situational",
-  "technical",
-  "system_design",
-  "culture_fit",
-];
 
 interface ToolStatus {
   registered: boolean;
@@ -60,6 +51,19 @@ let LOCAL_TOOLS: LocalToolDef[] = [];
 export function getLocalTools(): LocalToolDef[] {
   return LOCAL_TOOLS;
 }
+
+interface PlannedQuestion {
+  text: string;
+  type: QuestionType;
+  rubricPoints?: string[];
+  hint?: string;
+}
+
+// Holds the AI-authored question set between `start_interview` (which
+// receives them) and `run_interview` (which asks them one by one). Module
+// scoped rather than in the Zustand store since it's transient plan state,
+// not something the UI needs to render.
+let plannedQuestions: PlannedQuestion[] = [];
 
 function buildTools(): LocalToolDef[] {
   const store = useInterview.getState;
@@ -118,15 +122,40 @@ function buildTools(): LocalToolDef[] {
     // ─────────────────────────────────────────────────────────────────────
     {
       name: "start_interview",
-      title: "Start the mock interview",
+      title: "Start the mock interview with all your generated questions",
       description:
-        "Begin the mock interview. Optionally set total questions (default 6) and difficulty override. After calling this, IMMEDIATELY call `conduct_interview` to run the whole session autonomously — that single call handles the entire ask/wait/evaluate loop until the interview ends.",
+        "Begin the mock interview. YOU (the AI) must write ALL the interview questions yourself, right now, in this single call — there is no built-in question bank. Pass them as the `questions` array, each genuinely tailored to the candidate's profile (use their exact field/position/skills/experience — vary the type across behavioral, technical, situational, system_design, culture_fit). After this call, IMMEDIATELY call `run_interview` (no arguments) — that ONE call runs the entire ask/wait/evaluate loop for every question and blocks until the candidate finishes, returning the full transcript and final report at the end. Do not try to ask questions one at a time yourself.",
       inputSchema: {
         type: "object",
         properties: {
-          totalQuestions: { type: "number", minimum: 3, maximum: 20 },
           difficulty: { type: "string", enum: ["junior", "mid", "senior"] },
+          questions: {
+            type: "array",
+            minItems: 3,
+            maxItems: 20,
+            description:
+              "ALL the questions for this interview, in order, written by you and tailored to the candidate's profile. Vary the `type` across the list.",
+            items: {
+              type: "object",
+              properties: {
+                text: { type: "string", description: "The exact question text." },
+                type: {
+                  type: "string",
+                  enum: ["behavioral", "technical", "system_design", "situational", "culture_fit"],
+                },
+                rubricPoints: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "2-4 bullet points describing what a strong answer covers.",
+                },
+                hint: { type: "string", description: "Optional short on-screen hint for the candidate." },
+              },
+              required: ["text", "type"],
+              additionalProperties: false,
+            },
+          },
         },
+        required: ["questions"],
         additionalProperties: false,
       },
       readOnly: false,
@@ -139,35 +168,63 @@ function buildTools(): LocalToolDef[] {
               "Candidate profile not set. Call `set_candidate_profile` first with field, position, experienceYears, skills.",
           };
         }
-        const partial: { totalQuestions?: number; difficulty?: Difficulty } = {};
-        if (typeof input?.totalQuestions === "number") partial.totalQuestions = input.totalQuestions;
+
+        const rawQuestions = Array.isArray(input?.questions) ? input.questions : [];
+        const questions: PlannedQuestion[] = rawQuestions
+          .map((q: any) => ({
+            text: String(q?.text ?? "").trim(),
+            type: (q?.type as QuestionType) ?? "behavioral",
+            rubricPoints: Array.isArray(q?.rubricPoints) ? q.rubricPoints.map(String) : undefined,
+            hint: q?.hint ? String(q.hint) : undefined,
+          }))
+          .filter((q: PlannedQuestion) => q.text.length > 0);
+
+        if (questions.length < 3) {
+          return {
+            error: "not_enough_questions",
+            message: "Provide at least 3 tailored questions in the `questions` array, written by you for this candidate.",
+          };
+        }
+
+        const partial: { totalQuestions?: number; difficulty?: Difficulty } = {
+          totalQuestions: questions.length,
+        };
         if (input?.difficulty) partial.difficulty = input.difficulty as Difficulty;
         s.startInterview(partial);
+        plannedQuestions = questions;
+
         const updated = store();
         return {
           status: "started",
           totalQuestions: updated.config.totalQuestions,
           difficulty: updated.config.difficulty,
           next_action_hint:
-            "IMPORTANT: Call `conduct_interview` now. That single tool runs the entire ask → wait → evaluate loop for all questions and returns only when the candidate is done. Do NOT call ask_next_question / wait_for_answer / evaluate_answer manually.",
+            "IMPORTANT: call `run_interview` now, with no arguments. It runs the whole interview autonomously — displaying each of your questions, waiting for the candidate's answer, evaluating it, and moving to the next — and returns once with the full transcript and final report. You do not need to call anything else per question.",
         };
       },
     },
 
     // ─────────────────────────────────────────────────────────────────────
-    // The self-driving loop — the AI just calls this once.
+    // Runs the whole interview autonomously from the questions YOU supplied
+    // to start_interview. One call, blocks until done.
     // ─────────────────────────────────────────────────────────────────────
     {
-      name: "conduct_interview",
-      title: "Run the entire interview loop autonomously",
+      name: "run_interview",
+      title: "Run the entire interview using the questions you already wrote",
       description:
-        "Runs the full interview from the current question count to the end. For each remaining question: fetches it, displays it on the page, WAITS for the candidate to type and submit their answer, evaluates the answer, and moves on. Returns only when all questions are done, and includes the final report. This is the ONE tool you should call after `start_interview`.",
+        "Runs the full interview using the exact questions you passed to `start_interview`. For each one: displays it, WAITS for the candidate to type and submit their answer, evaluates it, and moves to the next — automatically, without any further tool calls from you. Returns once, at the very end, with every question/answer/evaluation and the final summary report. Call this immediately after `start_interview`.",
       inputSchema: { type: "object", properties: {}, additionalProperties: false },
       readOnly: false,
       execute: async () => {
         const s0 = store();
         if (!s0.profile) return { error: "no_profile", message: "Set profile first." };
         if (s0.phase !== "in_progress") return { error: "not_started", message: "Call `start_interview` first." };
+        if (plannedQuestions.length === 0) {
+          return {
+            error: "no_questions",
+            message: "No questions were provided. Call `start_interview` again with a `questions` array.",
+          };
+        }
 
         const perQuestionResults: Array<{
           index: number;
@@ -179,30 +236,19 @@ function buildTools(): LocalToolDef[] {
           gaps: string[];
         }> = [];
 
-        // Loop until we've asked all planned questions
-        // (state can change between iterations; re-read each time)
-        // Safety cap: never exceed configured totalQuestions
-        while (true) {
-          const s = store();
-          const answeredSoFar = s.history.filter((h) => h.evaluation).length;
-          if (answeredSoFar >= s.config.totalQuestions) break;
-
-          // 1. Ask next
-          const index = s.history.length + 1;
-          if (index > s.config.totalQuestions) break;
-          const askedTexts = s.history.map((h) => h.question.text);
-          const question = await apiGenerateQuestion({
-            profile: s.profile!,
+        for (let i = 0; i < plannedQuestions.length; i++) {
+          const planned = plannedQuestions[i];
+          const index = i + 1;
+          const question = {
+            id: `q-${Date.now()}-${index}`,
             index,
-            difficulty: s.config.difficulty,
-            askedTexts,
-            ...(TYPE_ROTATION_ARR[(index - 1) % TYPE_ROTATION_ARR.length]
-              ? { desiredType: TYPE_ROTATION_ARR[(index - 1) % TYPE_ROTATION_ARR.length] as QuestionType }
-              : {}),
-          });
+            type: planned.type,
+            text: planned.text,
+            hint: planned.hint,
+            rubricPoints: planned.rubricPoints,
+          };
           store().setCurrentQuestion(question);
 
-          // 2. Wait for candidate to type + submit
           let answer: string;
           try {
             answer = await awaitAnswer(question.id, 15 * 60 * 1000);
@@ -212,12 +258,11 @@ function buildTools(): LocalToolDef[] {
               reason: String(err instanceof Error ? err.message : err),
               partial_results: perQuestionResults,
               next_action_hint:
-                "The candidate skipped or timed out. You may call `end_interview` to generate a report from what we have, or `reset_session` to start over.",
+                "The candidate skipped or timed out. You may call `end_interview` (force: true) to generate a report from what we have, or `reset_session` to start over.",
             };
           }
           store().recordAnswer(answer);
 
-          // 3. Evaluate
           const evaluation = await apiEvaluateAnswer({
             question,
             answer,
@@ -236,10 +281,10 @@ function buildTools(): LocalToolDef[] {
           });
         }
 
-        // 4. Auto-summarize
         const s = store();
         const summary = await apiSummarize({ profile: s.profile!, history: s.history });
         store().endInterview(summary);
+        plannedQuestions = [];
 
         return {
           status: "complete",
@@ -247,128 +292,6 @@ function buildTools(): LocalToolDef[] {
           final_summary: summary,
           next_action_hint:
             "Interview complete. Share the summary with the candidate in a warm, encouraging tone. If they want another round, call `reset_session`.",
-        };
-      },
-    },
-
-    // ─────────────────────────────────────────────────────────────────────
-    // Ask + wait loop
-    // ─────────────────────────────────────────────────────────────────────
-    {
-      name: "ask_next_question",
-      title: "Fetch the next interview question",
-      description:
-        "Generate and display the next question. Returns the question text you should ask the candidate. Also updates the on-screen question panel.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          desiredType: {
-            type: "string",
-            enum: ["behavioral", "technical", "system_design", "situational", "culture_fit"],
-            description: "Optional override for what kind of question to ask next.",
-          },
-        },
-        additionalProperties: false,
-      },
-      readOnly: false,
-      execute: async (input) => {
-        const s = store();
-        if (!s.profile) return { error: "no_profile", message: "Set profile first." };
-        if (s.phase !== "in_progress") return { error: "not_started", message: "Call `start_interview` first." };
-
-        const askedTexts = s.history.map((h) => h.question.text);
-        const index = s.history.length + 1;
-
-        if (index > s.config.totalQuestions) {
-          return {
-            error: "interview_complete",
-            message: "All planned questions asked. Call `end_interview` for the summary.",
-          };
-        }
-
-        const question = await apiGenerateQuestion({
-          profile: s.profile,
-          index,
-          difficulty: s.config.difficulty,
-          askedTexts,
-          ...(input?.desiredType ? { desiredType: input.desiredType as QuestionType } : {}),
-        });
-
-        store().setCurrentQuestion(question);
-        return {
-          question: question.text,
-          type: question.type,
-          index,
-          totalQuestions: s.config.totalQuestions,
-          hint_for_candidate: question.hint,
-          next_action_hint:
-            "Ask the candidate this question verbatim. Then call `wait_for_answer` — that call BLOCKS until the candidate types their answer on the page and clicks Submit.",
-        };
-      },
-    },
-
-    {
-      name: "wait_for_answer",
-      title: "Block until the candidate submits an answer",
-      description:
-        "Waits for the candidate to type their answer in the on-page textarea and click Submit. Returns the answer text. Call this AFTER `ask_next_question`.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          timeoutSeconds: { type: "number", minimum: 5, maximum: 900, description: "Default 600 (10 min)." },
-        },
-        additionalProperties: false,
-      },
-      readOnly: true,
-      execute: async (input) => {
-        const s = store();
-        if (!s.currentQuestion) {
-          return { error: "no_question", message: "No question is active. Call `ask_next_question` first." };
-        }
-        try {
-          const timeoutMs = (Number(input?.timeoutSeconds) || 600) * 1000;
-          const answer = await awaitAnswer(s.currentQuestion.id, timeoutMs);
-          store().recordAnswer(answer);
-          return {
-            answer,
-            next_action_hint:
-              "Call `evaluate_answer` to get the scored evaluation, then `ask_next_question` for the next one (or `end_interview` if this was the last).",
-          };
-        } catch (err) {
-          return { error: "wait_failed", message: String(err instanceof Error ? err.message : err) };
-        }
-      },
-    },
-
-    {
-      name: "evaluate_answer",
-      title: "Score the most recent answer",
-      description:
-        "Evaluate the last submitted answer. Returns strengths, gaps, a suggestion, and a 0-10 score. The evaluation also appears in the on-page transcript.",
-      inputSchema: { type: "object", properties: {}, additionalProperties: false },
-      readOnly: false,
-      execute: async () => {
-        const s = store();
-        if (!s.profile) return { error: "no_profile" };
-        const last = s.history[s.history.length - 1];
-        if (!last || !last.answer) {
-          return { error: "no_answer", message: "No answered question to evaluate. Call `wait_for_answer` first." };
-        }
-        const evaluation = await apiEvaluateAnswer({
-          question: last.question,
-          answer: last.answer,
-          profile: s.profile,
-        });
-        store().recordEvaluation(evaluation);
-
-        const remaining = s.config.totalQuestions - s.history.length;
-        return {
-          evaluation,
-          remaining_questions: remaining,
-          next_action_hint:
-            remaining > 0
-              ? "Share the strengths and one gap with the candidate briefly, then call `ask_next_question`."
-              : "That was the last question. Share the evaluation, then call `end_interview` to generate the final report.",
         };
       },
     },
@@ -394,28 +317,43 @@ function buildTools(): LocalToolDef[] {
     },
 
     {
-      name: "skip_question",
-      title: "Skip the current question",
-      description: "Cancel the pending wait_for_answer and move on. Useful if the candidate is stuck.",
-      inputSchema: { type: "object", properties: {}, additionalProperties: false },
-      readOnly: false,
-      execute: async () => {
-        cancelPending("Skipped by interviewer.");
-        return { status: "skipped", next_action_hint: "Call `ask_next_question` for a new question." };
-      },
-    },
-
-    {
       name: "end_interview",
       title: "End the interview and generate a summary report",
       description:
-        "Ends the session and produces a final report: overall score, strengths, development areas, hire recommendation, and next steps.",
-      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+        "Ends the session and produces a final report: overall score, strengths, development areas, hire recommendation, and next steps. Only call this after `remaining_questions` reached 0 from `ask_question`, OR the candidate has explicitly asked to stop early. If questions are still remaining and the candidate hasn't asked to stop, this call will be REJECTED — call `ask_question` again instead.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          force: {
+            type: "boolean",
+            description:
+              "Set true ONLY if the candidate explicitly asked to end early / skip remaining questions. Otherwise omit — ending with unanswered questions remaining is rejected by default.",
+          },
+        },
+        additionalProperties: false,
+      },
       readOnly: false,
-      execute: async () => {
-        cancelPending("Interview ended.");
+      execute: async (input) => {
         const s = store();
         if (!s.profile) return { error: "no_profile" };
+
+        const answered = s.history.filter((h) => h.evaluation).length;
+        const remaining = s.config.totalQuestions - answered;
+        const force = input?.force === true;
+
+        if (remaining > 0 && !force) {
+          return {
+            error: "questions_remaining",
+            questions_answered: answered,
+            total_questions: s.config.totalQuestions,
+            remaining_questions: remaining,
+            message: `The interview isn't finished — ${remaining} of ${s.config.totalQuestions} questions haven't been asked yet.`,
+            next_action_hint:
+              `Do NOT end the interview yet. Generate question ${answered + 1} of ${s.config.totalQuestions} yourself, tailored to the candidate's profile, and call \`ask_question\` with it. Only call \`end_interview\` again (with force: true) if the candidate explicitly asks to stop early.`,
+          };
+        }
+
+        cancelPending("Interview ended.");
         const summary = await apiSummarize({ profile: s.profile, history: s.history });
         store().endInterview(summary);
         return {
@@ -435,6 +373,7 @@ function buildTools(): LocalToolDef[] {
       execute: async () => {
         cancelPending("Session reset.");
         store().reset();
+        plannedQuestions = [];
         return { status: "reset", next_action_hint: "Call `set_candidate_profile` to begin again." };
       },
     },
