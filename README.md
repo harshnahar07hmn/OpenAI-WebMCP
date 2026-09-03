@@ -10,8 +10,6 @@ The user first provides their profile, then the AI agent can start and manage th
 
 ## 👥 Team
 
-- Ejaz Ahamed Khan
-- Tejas Rastogi
 - Harsh Nahar
 - Tejas Dharmendra Patel
 - Prantik Sarkar
